@@ -213,6 +213,7 @@ def token_candidates(text: str) -> list[str]:
 
 def mention_candidates(rows: list[dict]) -> list[str]:
     mentions: list[str] = []
+    dotted_candidates: list[str] = []
 
     def add(value: str):
         handle = value.lstrip("@＠").strip("._").casefold()
@@ -224,20 +225,40 @@ def mention_candidates(rows: list[dict]) -> list[str]:
         tokens = [token for item in observations for token in token_candidates(item["text"])]
         for token in tokens:
             if token.startswith(("@", "＠")):
-                add(token)
+                handle = token.lstrip("@＠")
+                if "." in handle:
+                    dotted_candidates.append(handle)
+                else:
+                    add(handle)
 
-        dotted = [token.lstrip("@＠") for token in tokens if "." in token]
-        if dotted:
-            medoid = max(
-                dotted,
-                key=lambda value: sum(text_similarity(value, other) for other in dotted),
-            )
-            if len(observations) >= 2 or medoid.startswith(("@", "＠")):
-                if len(medoid) >= 6 and medoid[0].isupper() and medoid[1].islower():
-                    trimmed = medoid[1:]
-                    if any(text_similarity(trimmed, other) > text_similarity(medoid, other) for other in dotted):
-                        medoid = trimmed
-                add(medoid)
+        if len(observations) >= 2:
+            dotted_candidates.extend(token.lstrip("@＠") for token in tokens if "." in token)
+
+    clusters: list[list[str]] = []
+    for candidate in dotted_candidates:
+        candidate = candidate.strip("._")
+        if not candidate:
+            continue
+        for cluster in clusters:
+            if max(text_similarity(candidate, existing) for existing in cluster) >= 0.72:
+                cluster.append(candidate)
+                break
+        else:
+            clusters.append([candidate])
+
+    for cluster in clusters:
+        medoid = max(
+            cluster,
+            key=lambda value: (
+                sum(text_similarity(value, other) for other in cluster),
+                cluster.count(value),
+            ),
+        )
+        if len(medoid) >= 6 and medoid[0].isupper() and medoid[1].islower():
+            trimmed = medoid[1:]
+            if any(text_similarity(trimmed, other) > text_similarity(medoid, other) for other in cluster):
+                medoid = trimmed
+        add(medoid)
 
     return mentions
 
