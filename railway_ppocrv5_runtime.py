@@ -17,6 +17,7 @@ import paddle
 import paddleocr
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from opencc import OpenCC
 from paddleocr import PaddleOCR
 from pydantic import BaseModel, Field
 
@@ -46,6 +47,7 @@ def emit(tag, value):
 
 startup_started = time.perf_counter()
 ocr = PaddleOCR(**MODEL_CONFIG)
+traditionalizer = OpenCC("s2tw")
 initialization_seconds = time.perf_counter() - startup_started
 ocr_lock = threading.Lock()
 emit(
@@ -104,30 +106,143 @@ def canonical(text: str) -> str:
     return "".join(ch for ch in value if ch.isalnum() or "\u3400" <= ch <= "\u9fff")
 
 
-def same_line(a: str, b: str) -> bool:
+def traditional_text(text: str) -> str:
+    return traditionalizer.convert(unicodedata.normalize("NFKC", str(text))).strip()
+
+
+def text_similarity(a: str, b: str) -> float:
     left, right = canonical(a), canonical(b)
     if not left or not right:
-        return False
+        return 0.0
     if left == right:
-        return True
+        return 1.0
     shortest, longest = sorted((left, right), key=len)
     if len(shortest) >= 6 and shortest in longest and len(shortest) / len(longest) >= 0.88:
-        return True
-    return min(len(left), len(right)) >= 6 and SequenceMatcher(None, left, right).ratio() >= 0.92
+        return len(shortest) / len(longest)
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def normalized_box(poly, width: int, height: int) -> list[float] | None:
+    try:
+        points = list(poly)
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        if not xs or not ys:
+            return None
+        return [
+            max(0.0, min(xs) / width),
+            max(0.0, min(ys) / height),
+            min(1.0, max(xs) / width),
+            min(1.0, max(ys) / height),
+        ]
+    except (TypeError, ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def same_position(a: list[float] | None, b: list[float] | None) -> bool:
+    if not a or not b:
+        return False
+    aw, ah = max(a[2] - a[0], 0.001), max(a[3] - a[1], 0.001)
+    bw, bh = max(b[2] - b[0], 0.001), max(b[3] - b[1], 0.001)
+    acx, acy = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
+    bcx, bcy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    overlap_x = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) / min(aw, bw)
+    return (
+        abs(acy - bcy) <= max(0.02, max(ah, bh) * 1.15)
+        and (overlap_x >= 0.30 or abs(acx - bcx) <= max(0.05, max(aw, bw) * 0.35))
+        and 0.45 <= ah / bh <= 2.20
+    )
+
+
+def best_observation(observations: list[dict]) -> dict:
+    if len(observations) == 1:
+        return observations[0]
+    best = observations[0]
+    best_score = -1.0
+    for item in observations:
+        similarities = [
+            text_similarity(item["text"], other["text"])
+            for other in observations
+            if other is not item
+        ]
+        consensus = sum(similarities) / len(similarities) if similarities else 0.0
+        score = consensus + 0.12 * item["confidence"] + min(len(canonical(item["text"])), 40) * 0.001
+        if score > best_score:
+            best, best_score = item, score
+    return best
 
 
 def merge_line(rows: list[dict], candidate: dict) -> None:
     for index, existing in enumerate(rows):
-        if same_line(existing["text"], candidate["text"]):
-            existing["frames"] = sorted(set(existing["frames"] + candidate["frames"]))
-            if candidate["confidence"] > existing["confidence"]:
-                candidate["frames"] = existing["frames"]
-                rows[index] = candidate
+        similarity = text_similarity(existing["text"], candidate["text"])
+        different_frame = candidate["frame"] not in existing["frames"]
+        positional_match = different_frame and same_position(existing.get("box"), candidate.get("box"))
+        same_text = similarity >= 0.92 or (
+            min(len(canonical(existing["text"])), len(canonical(candidate["text"]))) >= 6
+            and similarity >= 0.82
+        )
+        positional_variant = positional_match and similarity >= (
+            0.52 if max(len(canonical(existing["text"])), len(canonical(candidate["text"]))) >= 12 else 0.62
+        )
+        if same_text or positional_variant:
+            existing["observations"].append(candidate)
+            existing["frames"] = sorted(set(existing["frames"] + [candidate["frame"]]))
+            representative = best_observation(existing["observations"])
+            existing["text"] = representative["text"]
+            existing["confidence"] = representative["confidence"]
+            existing["box"] = representative.get("box")
             return
-    rows.append(candidate)
+    rows.append(
+        {
+            "text": candidate["text"],
+            "confidence": candidate["confidence"],
+            "frames": [candidate["frame"]],
+            "box": candidate.get("box"),
+            "observations": [candidate],
+        }
+    )
 
 
-app = FastAPI(title="IG Archive PP-OCRv5", version="1.5.8.001")
+def token_candidates(text: str) -> list[str]:
+    return [
+        value
+        for value in re.findall(r"[@＠]?[A-Za-z0-9._]{4,30}", text)
+        if any(character.isalpha() for character in value)
+    ]
+
+
+def mention_candidates(rows: list[dict]) -> list[str]:
+    mentions: list[str] = []
+
+    def add(value: str):
+        handle = value.lstrip("@＠").strip("._").casefold()
+        if re.fullmatch(r"[a-z0-9._]{3,30}", handle) and handle not in mentions:
+            mentions.append(handle)
+
+    for row in rows:
+        observations = row.get("observations", [])
+        tokens = [token for item in observations for token in token_candidates(item["text"])]
+        for token in tokens:
+            if token.startswith(("@", "＠")):
+                add(token)
+
+        dotted = [token.lstrip("@＠") for token in tokens if "." in token]
+        if dotted:
+            medoid = max(
+                dotted,
+                key=lambda value: sum(text_similarity(value, other) for other in dotted),
+            )
+            if len(observations) >= 2 or medoid.startswith(("@", "＠")):
+                if len(medoid) >= 6 and medoid[0].isupper() and medoid[1].islower():
+                    trimmed = medoid[1:]
+                    if any(text_similarity(trimmed, other) > text_similarity(medoid, other) for other in dotted):
+                        medoid = trimmed
+                add(medoid)
+
+    return mentions
+
+
+app = FastAPI(title="IG Archive PP-OCRv5", version="1.5.8.002")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -140,7 +255,7 @@ app.add_middleware(
 def health():
     return {
         "ok": True,
-        "version": "1.5.8.001",
+        "version": "1.5.8.002",
         "models": ["PP-OCRv5_mobile_det", "PP-OCRv5_mobile_rec"],
         "initializationSeconds": initialization_seconds,
     }
@@ -166,20 +281,28 @@ def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=Non
             if len(predictions) != 1:
                 raise RuntimeError(f"Expected one prediction, got {len(predictions)}")
             data = result_data(predictions[0])
-            texts = [str(value).strip() for value in data.get("rec_texts", [])]
+            texts = [traditional_text(value) for value in data.get("rec_texts", [])]
             scores = [float(value) for value in data.get("rec_scores", [])]
+            polys = data.get("rec_polys", [])
             if len(texts) != len(scores):
                 raise RuntimeError("Text and score counts do not match")
             kept = 0
-            for text, score in zip(texts, scores):
+            height, width = image.shape[:2]
+            for line_index, (text, score) in enumerate(zip(texts, scores)):
                 if not text:
                     continue
                 kept += 1
                 merge_line(
                     merged,
-                    {"text": text, "confidence": score, "frames": [frame_index]},
+                    {
+                        "text": text,
+                        "confidence": score,
+                        "frame": frame_index,
+                        "box": normalized_box(polys[line_index], width, height)
+                        if line_index < len(polys)
+                        else None,
+                    },
                 )
-            height, width = image.shape[:2]
             frame_summaries.append(
                 {
                     "index": frame_index,
@@ -192,25 +315,29 @@ def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=Non
                     "inferenceSeconds": inference_seconds,
                 }
             )
-            del predictions, data, texts, scores, image, frame_bytes
+            del predictions, data, texts, scores, polys, image, frame_bytes
             gc.collect()
 
     confidences = [row["confidence"] for row in merged]
     raw_text = [row["text"] for row in merged]
-    mentions = []
-    for line in raw_text:
-        for match in re.findall(r"@[A-Za-z0-9._]{1,30}", line):
-            handle = match[1:]
-            if handle.casefold() not in [value.casefold() for value in mentions]:
-                mentions.append(handle)
+    mentions = mention_candidates(merged)
+    response_lines = [
+        {
+            "text": row["text"],
+            "confidence": row["confidence"],
+            "frames": row["frames"],
+            "box": row.get("box"),
+        }
+        for row in merged
+    ]
     response = {
         "ok": True,
-        "engine": "Railway official PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec",
+        "engine": "Railway official PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec + Traditional Chinese normalization",
         "modelConfig": MODEL_CONFIG,
         "sampledFrames": len(request.frames),
         "sampledTimes": [frame.time for frame in request.frames if frame.time is not None],
         "rawText": raw_text,
-        "lines": merged,
+        "lines": response_lines,
         "mentions": mentions,
         "lineCount": len(raw_text),
         "averageConfidence": sum(confidences) / len(confidences) if confidences else 0.0,
@@ -229,4 +356,3 @@ def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=Non
         },
     )
     return response
-

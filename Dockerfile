@@ -14,7 +14,8 @@ RUN python -m pip install --no-cache-dir \
     paddlepaddle==3.2.1 \
     paddleocr==3.5.0 \
     fastapi==0.116.1 \
-    uvicorn==0.35.0
+    uvicorn==0.35.0 \
+    opencc-python-reimplemented==0.1.7
 
 RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(text_detection_model_name='PP-OCRv5_mobile_det',text_recognition_model_name='PP-OCRv5_mobile_rec',use_doc_orientation_classify=False,use_doc_unwarping=False,use_textline_orientation=False,device='cpu')"
 
