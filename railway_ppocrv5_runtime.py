@@ -1,5 +1,6 @@
 import base64
 import binascii
+import gc
 import hashlib
 import json
 import os
@@ -149,15 +150,16 @@ def health():
 def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=None)):
     if x_igad_token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid OCR token")
-    decoded = [decode_frame(frame.dataUrl) for frame in request.frames]
-    if sum(len(frame_bytes) for frame_bytes, _ in decoded) > MAX_TOTAL_BYTES:
-        raise HTTPException(status_code=413, detail="Combined frame size exceeds the limit")
-
     started = time.perf_counter()
     merged: list[dict] = []
     frame_summaries = []
+    total_bytes = 0
     with ocr_lock:
-        for frame_index, ((frame_bytes, image), frame) in enumerate(zip(decoded, request.frames)):
+        for frame_index, frame in enumerate(request.frames):
+            frame_bytes, image = decode_frame(frame.dataUrl)
+            total_bytes += len(frame_bytes)
+            if total_bytes > MAX_TOTAL_BYTES:
+                raise HTTPException(status_code=413, detail="Combined frame size exceeds the limit")
             inference_started = time.perf_counter()
             predictions = list(ocr.predict(input=image))
             inference_seconds = time.perf_counter() - inference_started
@@ -190,6 +192,8 @@ def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=Non
                     "inferenceSeconds": inference_seconds,
                 }
             )
+            del predictions, data, texts, scores, image, frame_bytes
+            gc.collect()
 
     confidences = [row["confidence"] for row in merged]
     raw_text = [row["text"] for row in merged]
@@ -225,3 +229,4 @@ def recognize(request: OcrRequest, x_igad_token: str | None = Header(default=Non
         },
     )
     return response
+
